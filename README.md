@@ -1,6 +1,6 @@
 - 👋 Hi, I’m @hanCodingg
-- 👀 I’m interested in Web Development and Apps Development
-- 🌱 I’m currently learning HTML, CSS, and Javascript
+- 👀 I’m interested in Embedded Device, Telecomunication, Web Development and Apps Development
+- 🌱 I’m currently learning Python, C++, HTML, CSS, and Javascript
 - 📫 Follow my instagram for further information at @raihannwar_
 
 <!---
