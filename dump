@@ -1,210 +1,196 @@
-/*
- * SPDX-FileCopyrightText: 2023 Espressif Systems (Shanghai) CO LTD
- *
- * SPDX-License-Identifier: CC0-1.0
- */
-
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "esp_err.h"
-#include "driver/gpio.h"
 #include "driver/spi_master.h"
+#include "driver/gpio.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_vendor.h"
 #include "esp_lcd_panel_ops.h"
+#include "esp_lcd_st7735.h"
 #include "esp_check.h"
 #include "esp_log.h"
-#include "string.h"
-#include "esp_lcd_st7735.h"
 
+#define LCD_HOST       SPI2_HOST
 
-/* LCD Dimensions */
-#define LCD_H_RES          (128)    // LCD horizontal resolution
-#define LCD_V_RES          (128)    // LCD vertical resolution
+#define PIN_SCLK       GPIO_NUM_12
+#define PIN_MOSI       GPIO_NUM_11
+#define PIN_CS         GPIO_NUM_10
+#define PIN_DC         GPIO_NUM_8
+#define PIN_RST        GPIO_NUM_9
+#define PIN_BL         GPIO_NUM_7
 
-/* LCD SPI Configuration */
-#define LCD_SPI_NUM        (SPI2_HOST)       // SPI host to use
-#define LCD_PIXEL_CLK_HZ   (40 * 1000 * 1000) // SPI clock frequency (40MHz)
-#define LCD_CMD_BITS       (8)                // Command bit width
-#define LCD_PARAM_BITS     (8)                // Parameter bit width
-#define LCD_BITS_PER_PIXEL (16)               // Pixel bit width (RGB565 format)
-#define LCD_BL_ON_LEVEL    (1)                // Backlight on level (1=high level, 0=low level)
+#define LCD_H_RES      160
+#define LCD_V_RES      80
 
-/* LCD Pin Definitions */
-#define LCD_GPIO_SCLK      (GPIO_NUM_12) // SPI clock pin
-#define LCD_GPIO_MOSI      (GPIO_NUM_11) // SPI data output pin (ST7735 simplex, MISO not required)
-#define LCD_GPIO_RST       (GPIO_NUM_9) // Reset pin
-#define LCD_GPIO_DC        (GPIO_NUM_8) // Command/data distinction pin
-#define LCD_GPIO_CS        (GPIO_NUM_10) // Chip select pin
-#define LCD_GPIO_BL        (GPIO_NUM_7) // Backlight pin
+#define SPI_CLOCK      (40 * 1000 * 1000)
 
-static const char *TAG = "LCD_DRIVER";       
-static esp_lcd_panel_io_handle_t lcd_io = NULL;  // LCD panel IO handle (SPI communication layer)
-esp_lcd_panel_handle_t lcd_panel = NULL;  // LCD panel handle (ST7735 driver layer)
+static const char *TAG = "LCD";
 
+esp_lcd_panel_io_handle_t io_handle = NULL;
+esp_lcd_panel_handle_t panel_handle = NULL;
 
-// static st7735_lcd_init_cmd_t st7735_init_cmds[] = {
-//     // Rcmd1                                                                                      // Software reset, 150 ms delay
-//     {ST7735_SLPOUT, (uint8_t[]){0x00}, 1, 120},                                                                                           // Out of sleep mode, 255 ms delay
-//     {ST7735_FRMCTR1, (uint8_t[]){0x05, 0x3C, 0x3C}, 3, 0},                                                                                // Frame rate ctrl - normal mode
-//     {ST7735_FRMCTR2, (uint8_t[]){0x05, 0x3C, 0x3C}, 3, 0},                                                                                // Frame rate control - idle mode
-//     {ST7735_FRMCTR3, (uint8_t[]){0x05, 0x3C, 0x3C, 0x05, 0x3C, 0x3C}, 6, 0},                                                              // Frame rate ctrl - partial mode
-//     {ST7735_INVCTR, (uint8_t[]){0x03}, 1, 0},                                                                                             // Display inversion ctrl
-//     {ST7735_PWCTR1, (uint8_t[]){0xA4, 0x04, 0x84}, 3, 0},                                                                                 // Power control
-//     {ST7735_PWCTR2, (uint8_t[]){0xC8}, 1, 0},                                                                                             // Power control
-//     {ST7735_PWCTR3, (uint8_t[]){0x0D, 0x00}, 2, 0},                                                                                       // Power control
-//     {ST7735_PWCTR4, (uint8_t[]){0x8D, 0x2A}, 2, 0},                                                                                       // Power control
-//     {ST7735_PWCTR5, (uint8_t[]){0x8D, 0xEE}, 2, 0},                                                                                       // Power control
-//     {ST7735_VMCTR1, (uint8_t[]){0x1D}, 1, 0},                                                                                             // Power control                                
-//     {ST7735_GMCTRP1, (uint8_t[]){0x0C, 0x0A, 0x06, 0x00, 0x1A, 0x11, 0x0B, 0x0A, 0x0B, 0x0C, 0x19, 0x33, 0x00, 0x06, 0x02, 0x10}, 16, 0}, // Positive Gamma
-//     {ST7735_GMCTRN1, (uint8_t[]){0x0D, 0x0F, 0x03, 0x00, 0x11, 0x0A, 0x06, 0x08, 0x09, 0x0D, 0x1C, 0x3A, 0x00, 0x09, 0x07, 0x10}, 16, 0}, // Negative Gamma
-//     {ST7735_TEON, (uint8_t[]){0x00}, 1, 0},
-//     {ST7735_COLMOD, (uint8_t[]){0x05}, 1, 0}, 
-//     {ST7735_MADCTL, (uint8_t[]){0xC8}, 1, 0},                                                                                 // Normal display on, no args, w/delay 10 ms delay
-
-// };
-
-
-void lcd_fill_screen(esp_lcd_panel_handle_t panel_handle, uint16_t color)
+static void lcd_init(void)
 {
-    uint32_t pixel_count = LCD_H_RES * LCD_V_RES;
-    uint8_t *color_buf = heap_caps_malloc(pixel_count * 2, MALLOC_CAP_DMA);
-    if (color_buf == NULL) {
-        ESP_LOGE("LCD", "malloc failed");
-        return;
-    }
-
-    uint8_t color_high = (color >> 8) & 0xFF; 
-    uint8_t color_low = color & 0xFF;         
-
-    for (uint32_t i = 0; i < pixel_count; i++) {
-        color_buf[i * 2]     = color_high;
-        color_buf[i * 2 + 1] = color_low;
-    }
-    esp_lcd_panel_draw_bitmap(panel_handle, 0, 0,LCD_H_RES, LCD_V_RES, (uint16_t *)color_buf);
-    free(color_buf);
-}
-
-
-static esp_err_t lcd_backlight_init(void)
-{
-    gpio_config_t bk_gpio_config = {
-        .mode = GPIO_MODE_OUTPUT,
-        .pin_bit_mask = 1ULL << LCD_GPIO_BL
+    // SPI bus
+    spi_bus_config_t buscfg = {
+        .sclk_io_num = PIN_SCLK,
+        .mosi_io_num = PIN_MOSI,
+        .miso_io_num = -1,
+        .max_transfer_sz = LCD_H_RES * 40 * sizeof(uint16_t),
     };
-    return gpio_config(&bk_gpio_config);
-}
+    ESP_ERROR_CHECK(spi_bus_initialize(LCD_HOST, &buscfg, SPI_DMA_CH_AUTO));
 
-
-static esp_err_t lcd_spi_bus_init(void)
-{
-    const spi_bus_config_t buscfg = {
-        .sclk_io_num = LCD_GPIO_SCLK,
-        .mosi_io_num = LCD_GPIO_MOSI,
-        .miso_io_num = GPIO_NUM_NC,  // ST7735 doesn't need MISO (simplex communication)
-        .quadwp_io_num = GPIO_NUM_NC,
-        .quadhd_io_num = GPIO_NUM_NC,
-        .max_transfer_sz = LCD_H_RES * LCD_V_RES * sizeof(uint16_t) 
-    };
-    return spi_bus_initialize(LCD_SPI_NUM, &buscfg, SPI_DMA_CH_AUTO);
-}
-
-
-esp_err_t lcd_init(void)
-{
-    esp_err_t ret = ESP_OK;
-    // 1. Initialize backlight pin
-    ESP_GOTO_ON_ERROR(lcd_backlight_init(), err, TAG, "Backlight init failed");
-
-    // 2. Initialize SPI bus
-    ESP_LOGD(TAG, "Initialize SPI bus for ST7735");
-    ESP_GOTO_ON_ERROR(lcd_spi_bus_init(), err, TAG, "SPI bus init failed");
-
-    // 3. Install LCD panel IO (SPI protocol adaptation)
-    ESP_LOGD(TAG, "Install LCD panel IO (SPI)");
-    const esp_lcd_panel_io_spi_config_t io_config = {
-        .dc_gpio_num = LCD_GPIO_DC,
-        .cs_gpio_num = LCD_GPIO_CS,
-        .pclk_hz = LCD_PIXEL_CLK_HZ,
-        .lcd_cmd_bits = LCD_CMD_BITS,
-        .lcd_param_bits = LCD_PARAM_BITS,
+    // Panel IO
+    esp_lcd_panel_io_spi_config_t io_cfg = {
+        .dc_gpio_num = PIN_DC,
+        .cs_gpio_num = PIN_CS,
+        .pclk_hz = SPI_CLOCK,
+        .lcd_cmd_bits = 8,
+        .lcd_param_bits = 8,
         .spi_mode = 0,
-        .trans_queue_depth = 10
+        .trans_queue_depth = 10,
     };
-    ESP_GOTO_ON_ERROR(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)LCD_SPI_NUM, &io_config, &lcd_io), 
-                      err, TAG, "Panel IO init failed");
+    ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)LCD_HOST,
+                                             &io_cfg, &io_handle));
 
-    // st7735_vendor_config_t vendor_config={  
-    // .init_cmds = st7735_init_cmds,
-    // .init_cmds_size = sizeof(st7735_init_cmds) / sizeof(st7735_lcd_init_cmd_t),
-    // };
-
-    // 4. Install ST7735 LCD driver
-    ESP_LOGD(TAG, "Install ST7735 panel driver");
-    const esp_lcd_panel_dev_config_t panel_config = {
-        .reset_gpio_num = LCD_GPIO_RST,
-        .data_endian = LCD_RGB_ELEMENT_ORDER_BGR,
-        .bits_per_pixel = LCD_BITS_PER_PIXEL,
-        // .vendor_config =&vendor_config,
+    // Panel
+    esp_lcd_panel_dev_config_t panel_cfg = {
+        .reset_gpio_num = PIN_RST,
+        .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_BGR,
+        .bits_per_pixel = 16,
     };
-    ESP_GOTO_ON_ERROR(esp_lcd_new_panel_st7735(lcd_io, &panel_config, &lcd_panel), 
-                      err, TAG, "ST7735 driver init failed");
 
-    // 5. Reset and initialize ST7735 panel
-    ESP_LOGD(TAG, "Reset and init ST7735 panel");
-    ESP_GOTO_ON_ERROR(esp_lcd_panel_reset(lcd_panel), err, TAG, "Panel reset failed");
-    ESP_GOTO_ON_ERROR(esp_lcd_panel_init(lcd_panel), err, TAG, "Panel init failed");
+    ESP_ERROR_CHECK(esp_lcd_new_panel_st7735(io_handle, &panel_cfg, &panel_handle));
 
-    ESP_GOTO_ON_ERROR(esp_lcd_panel_set_gap(lcd_panel,2,3),err, TAG, "Set gap failed");
-    
-    // ST7735 has default color inversion; enable color correction
-    ESP_GOTO_ON_ERROR(esp_lcd_panel_invert_color(lcd_panel, true), err, TAG, "Invert color failed");
-    // Turn on LCD display
-    ESP_GOTO_ON_ERROR(esp_lcd_panel_disp_on_off(lcd_panel, true), err, TAG, "Turn on display failed");
-    lcd_fill_screen(lcd_panel, 0x0000);
-    vTaskDelay(pdMS_TO_TICKS(500));
+    ESP_ERROR_CHECK(esp_lcd_panel_reset(panel_handle));
+    ESP_ERROR_CHECK(esp_lcd_panel_init(panel_handle));
 
-    // 6. Turn on LCD backlight
-    vTaskDelay(pdMS_TO_TICKS(500));
-    ESP_LOGD(TAG, "Turn on LCD backlight");
-    ESP_GOTO_ON_ERROR(gpio_set_level(LCD_GPIO_BL, LCD_BL_ON_LEVEL), err, TAG, "Turn on backlight failed");
+    // ✅ IMPORTANT for 160×80 mini
+    ESP_ERROR_CHECK(esp_lcd_panel_set_gap(panel_handle, 26, 1));
 
-    ESP_LOGI(TAG, "ST7735 LCD init success");
-    return ret;
+    // ✅ Common for this module
+    ESP_ERROR_CHECK(esp_lcd_panel_invert_color(panel_handle, true));
 
-err:
-    // Initialization failed: Release allocated resources to avoid memory leak
-    if (lcd_panel != NULL) {
-        esp_lcd_panel_del(lcd_panel);
-        lcd_panel = NULL;
-    }
-    if (lcd_io != NULL) {
-        esp_lcd_panel_io_del(lcd_io);
-        lcd_io = NULL;
-    }
-    spi_bus_free(LCD_SPI_NUM);
-    ESP_LOGE(TAG, "ST7735 LCD init failed (err: %s)", esp_err_to_name(ret));
-    return ret;
+    ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel_handle, true));
+
+    // Backlight
+    gpio_config_t bk = {
+        .mode = GPIO_MODE_OUTPUT,
+        .pin_bit_mask = 1ULL << PIN_BL
+    };
+    ESP_ERROR_CHECK(gpio_config(&bk));
+    gpio_set_level(PIN_BL, 1);
+
+    ESP_LOGI(TAG, "LCD ready");
 }
 
+#include "lvgl.h"
+#include "esp_timer.h"
+#include "sys/lock.h"
+
+static _lock_t lvgl_lock;
+static lv_display_t *disp;
+
+// Flush ready callback
+static bool lvgl_flush_ready_cb(esp_lcd_panel_io_handle_t io,
+                                esp_lcd_panel_io_event_data_t *edata,
+                                void *user_ctx)
+{
+    lv_display_t *d = (lv_display_t *)user_ctx;
+    lv_display_flush_ready(d);
+    return false;
+}
+
+// Flush function
+static void lvgl_flush_cb(lv_display_t *disp,
+                          const lv_area_t *area,
+                          uint8_t *px_map)
+{
+    esp_lcd_panel_handle_t panel = lv_display_get_user_data(disp);
+
+    int x1 = area->x1;
+    int y1 = area->y1;
+    int x2 = area->x2;
+    int y2 = area->y2;
+
+    // Swap RGB565 bytes if needed
+    lv_draw_sw_rgb565_swap(px_map, (x2 - x1 + 1) * (y2 - y1 + 1));
+
+    esp_lcd_panel_draw_bitmap(panel, x1, y1, x2 + 1, y2 + 1, px_map);
+}
+
+static void lvgl_tick(void *arg)
+{
+    lv_tick_inc(2);
+}
+
+static void lvgl_task(void *arg)
+{
+    while (1) {
+        _lock_acquire(&lvgl_lock);
+        uint32_t delay = lv_timer_handler();
+        _lock_release(&lvgl_lock);
+
+        if (delay < 1) delay = 1;
+        vTaskDelay(pdMS_TO_TICKS(delay));   // ✅ CORRECT
+    }
+}
+
+static void ui_init(void)
+{
+    lv_obj_set_style_bg_color(lv_screen_active(),
+                              lv_color_hex(0x003a57), 0);
+
+    lv_obj_t *label = lv_label_create(lv_screen_active());
+    lv_label_set_text(label, "Hello PCI");
+    lv_obj_set_style_text_color(label, lv_color_hex(0xFFFFFF), 0);
+
+    lv_obj_align(label, LV_ALIGN_CENTER, 0, 0);
+}
 
 void app_main(void)
 {
     lcd_init();
 
-    while(1) {
+    lv_init();
 
-        lcd_fill_screen(lcd_panel, 0xF800); // fill with red
-        vTaskDelay(pdMS_TO_TICKS(2000));
+    // Create LVGL display
+    disp = lv_display_create(LCD_H_RES, LCD_V_RES);
 
-        lcd_fill_screen(lcd_panel, 0x07E0); // fill with green
-        vTaskDelay(pdMS_TO_TICKS(2000));
+    // Buffers (DMA safe)
+    size_t buf_size = LCD_H_RES * 20 * sizeof(lv_color16_t);
 
-        lcd_fill_screen(lcd_panel, 0x001F); // fill with blue
-        vTaskDelay(pdMS_TO_TICKS(2000));
+    void *buf1 = heap_caps_malloc(buf_size, MALLOC_CAP_DMA);
+    void *buf2 = heap_caps_malloc(buf_size, MALLOC_CAP_DMA);
 
-        lcd_fill_screen(lcd_panel, 0xFFE0); // fill with yellow
-        vTaskDelay(pdMS_TO_TICKS(2000));
+    assert(buf1 && buf2);
 
-    }
+    lv_display_set_buffers(disp, buf1, buf2,
+                           buf_size, LV_DISPLAY_RENDER_MODE_PARTIAL);
+
+    lv_display_set_user_data(disp, panel_handle);
+    lv_display_set_color_format(disp, LV_COLOR_FORMAT_RGB565);
+    lv_display_set_flush_cb(disp, lvgl_flush_cb);
+
+    // Register flush done callback
+    esp_lcd_panel_io_callbacks_t cbs = {
+        .on_color_trans_done = lvgl_flush_ready_cb,
+    };
+    esp_lcd_panel_io_register_event_callbacks(io_handle, &cbs, disp);
+
+    // LVGL tick timer
+    const esp_timer_create_args_t tick_cfg = {
+        .callback = lvgl_tick,
+        .name = "lv_tick"
+    };
+    esp_timer_handle_t timer;
+    esp_timer_create(&tick_cfg, &timer);
+    esp_timer_start_periodic(timer, 2000); // 2 ms
+
+    // Create UI
+    _lock_acquire(&lvgl_lock);
+    ui_init();
+    _lock_release(&lvgl_lock);
+
+    // Start LVGL task
+    xTaskCreate(lvgl_task, "lvgl", 4096, NULL, 2, NULL);
 }
